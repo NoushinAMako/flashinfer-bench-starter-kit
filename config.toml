@@ -1,8 +1,9 @@
 [solution]
-name = "dsa-topk-v1"      # Solution name
-definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "makora/team"              # Team/author name
+name = "dsa-topk-v1"
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+author = "makora/team"
 
 [build]
-language = "cuda"               # triton | cuda
-entry_point = "kernel.cu::kernel"            # Kernel function name
+language = "triton"
+entry_point = "kernel.py::run"
+
