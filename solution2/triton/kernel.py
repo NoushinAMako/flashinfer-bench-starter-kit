@@ -1,13 +1,10 @@
 """
-DSA TopK Indexer v8 - Full CUDA kernels + cuBLAS matmul
+DSA TopK Indexer - kernel5 (fixed)
 
-CUDA Kernels:
-  1. dequant_fp8_kernel: FP8 page gather + dequant + scale (NaN-correct)
-  2. relu_weight_kernel: Fused ReLU + weight multiply (NaN-preserving)
-  3. convert_indices_kernel: Local topk → global token indices
-
-cuBLAS (via at::mm): matmul (bit-identical to reference)
-at:: ops: sum(0) for head reduction, topk for selection
+Fix: replaced relu_weight_sum_kernel (sequential per-token head accumulation)
+with relu_weight_mul_kernel (in-place) + scores.sum(0) (PyTorch tree reduction).
+Root cause: sequential accumulation gives different floating-point rounding from
+PyTorch's reduction, causing different topk orderings at score boundaries.
 """
 
 import torch
@@ -43,16 +40,8 @@ _cuda_src = r"""
 #define TOPK 2048
 #define BYTES_PER_PAGE 8448
 
-// ======================================================================
-// FP8 e4m3fn -> float32 conversion (NaN-correct)
-//
-// Key: byte 0x7F and 0xFF are NaN in e4m3fn. Must produce float32 NaN.
-// PyTorch's .view(float8_e4m3fn).float() does this correctly.
-// ======================================================================
 __device__ __forceinline__ float fp8e4m3_to_float(uint8_t x) {
-    // NaN check: e4m3fn NaN = exp=15, mant=7 (0x7F positive, 0xFF negative)
     if ((x & 0x7F) == 0x7F) {
-        // Produce quiet NaN with correct sign
         uint32_t sign = (uint32_t)(x >> 7) << 31;
         return __uint_as_float(sign | 0x7FC00000u);
     }
@@ -61,30 +50,18 @@ __device__ __forceinline__ float fp8e4m3_to_float(uint8_t x) {
     uint32_t exp  = (x >> 3) & 0xF;
     uint32_t mant = x & 0x7;
 
-    // Zero (positive or negative)
     if ((x & 0x7F) == 0) return __uint_as_float(sign);
 
     uint32_t f;
     if (exp == 0) {
-        // Subnormal: val = (-1)^s * 2^(-6) * (mant/8)
         uint32_t hb = 31 - __clz(mant);
         f = sign | ((118u + hb) << 23) | ((mant ^ (1u << hb)) << (23 - hb));
     } else {
-        // Normal: val = (-1)^s * 2^(exp-7) * (1 + mant/8)
         f = sign | ((exp + 120u) << 23) | ((uint32_t)mant << 20);
     }
     return __uint_as_float(f);
 }
 
-// ======================================================================
-// Kernel 1: FP8 Dequantization
-// One block per page, 64 threads (one per token within page).
-// Each thread dequantizes 128 FP8 values for its token.
-//
-// Memory layout (packed per page, 8448 bytes):
-//   [0, 8192):    FP8 data - 64 tokens x 128 dims
-//   [8192, 8448): scales  - 64 x float32
-// ======================================================================
 __global__ void dequant_fp8_kernel(
     const uint8_t* __restrict__ k_cache,
     const int*     __restrict__ page_ids,
@@ -105,7 +82,6 @@ __global__ void dequant_fp8_kernel(
 
     float* out_row = K_out + ((long long)page_local * PAGE_SIZE + tok) * HEAD_DIM;
 
-    // Vectorized 4-byte loads
     #pragma unroll 8
     for (int d = 0; d < HEAD_DIM; d += 4) {
         uint32_t packed = __ldg(reinterpret_cast<const uint32_t*>(fp8_row + d));
@@ -116,43 +92,21 @@ __global__ void dequant_fp8_kernel(
     }
 }
 
-// ======================================================================
-// Kernel 2: Fused ReLU + Weight Multiply (in-place)
-//
-// CRITICAL NaN handling: must use (v <= 0 ? 0 : v) NOT (v > 0 ? v : 0)
-// The difference: NaN <= 0 is FALSE -> returns v (NaN preserved)
-//                 NaN > 0  is FALSE -> returns 0 (NaN destroyed)
-// PyTorch's relu_ uses the <= form, so we must match.
-// ======================================================================
-__global__ void relu_weight_kernel(
-    float*       __restrict__ scores,   // [NUM_HEADS, sl] row-major
-    const float* __restrict__ w,        // [NUM_HEADS]
-    int total                           // NUM_HEADS * sl
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    float v = scores[idx];
-    scores[idx] = v <= 0.0f ? 0.0f : v;
-}
-
-// Weight multiply: scores[h, t] *= w[h]
-__global__ void weight_mul_kernel(
-    float*       __restrict__ scores,  // [NUM_HEADS, sl] row-major
+// In-place ReLU + weight multiply: scores[h, t] = relu(scores[h, t]) * w[h]
+// Must be followed by scores.sum(0) to match reference numerically.
+__global__ void relu_weight_mul_kernel(
+    float*       __restrict__ scores,  // [NUM_HEADS, sl] row-major, modified in-place
     const float* __restrict__ w,       // [NUM_HEADS]
     int sl,
     int total
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-
     const int h = idx / sl;
-    scores[idx] *= w[h];
+    float v = scores[idx];
+    scores[idx] = (v <= 0.0f ? 0.0f : v) * w[h];
 }
 
-// ======================================================================
-// Kernel 3: Index Conversion
-// ======================================================================
 __global__ void convert_indices_kernel(
     const int64_t* __restrict__ topk_idx,
     const int64_t* __restrict__ page_ids,
@@ -166,9 +120,6 @@ __global__ void convert_indices_kernel(
     out[i] = (int)(page_ids[idx / PAGE_SIZE] * PAGE_SIZE + idx % PAGE_SIZE);
 }
 
-// ======================================================================
-// Host entry point
-// ======================================================================
 void dsa_topk_run(
     torch::Tensor q_fp8,
     torch::Tensor k_cache_fp8,
@@ -187,14 +138,11 @@ void dsa_topk_run(
 
     topk_indices.fill_(-1);
 
-    // Pre-convert Q to float32
-    auto q_f32 = q_fp8.to(torch::kFloat32);  // [B, 64, 128]
+    auto q_f32 = q_fp8.to(torch::kFloat32);
 
-    // Raw byte pointer for KV cache
     auto k_cache_u8 = k_cache_fp8.view(torch::kUInt8).contiguous();
     const uint8_t* k_ptr = k_cache_u8.data_ptr<uint8_t>();
 
-    // Pre-allocate reusable K buffer
     auto K_buf = torch::empty({max_tokens, HEAD_DIM},
         torch::dtype(torch::kFloat32).device(device));
 
@@ -206,54 +154,36 @@ void dsa_topk_run(
         if (sl == 0) continue;
 
         const int np_seq = (sl + PAGE_SIZE - 1) / PAGE_SIZE;
-        const int total = NUM_HEADS * sl;
 
-        // Page indices
         auto pages_long = block_table[b].slice(0, 0, np_seq).to(torch::kLong);
-        auto pages_i32 = block_table[b].slice(0, 0, np_seq).to(torch::kInt32).contiguous();
+        auto pages_i32  = block_table[b].slice(0, 0, np_seq).to(torch::kInt32).contiguous();
 
-        // ---- CUDA Kernel 1: FP8 dequant ----
         dequant_fp8_kernel<<<np_seq, PAGE_SIZE, 0, stream>>>(
             k_ptr,
             pages_i32.data_ptr<int>(),
             K_buf.data_ptr<float>(),
             np_seq);
 
-        auto K = K_buf.slice(0, 0, sl);  // [sl, 128]
+        auto K = K_buf.slice(0, 0, sl);
 
-        // ---- cuBLAS matmul (at::mm = torch.mm, bit-identical) ----
-        auto scores = at::mm(q_f32[b], K.t());  // [64, sl]
+        auto scores = at::mm(q_f32[b], K.t());  // [NUM_HEADS, sl]
 
-        // ---- CUDA Kernel 2a: ReLU (NaN-preserving, in-place) ----
+        // In-place ReLU + weight multiply, then PyTorch sum(0) to match reference numerically
+        const int total = NUM_HEADS * sl;
         {
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
-            relu_weight_kernel<<<blocks, threads, 0, stream>>>(
+            relu_weight_mul_kernel<<<blocks, threads, 0, stream>>>(
                 scores.data_ptr<float>(),
                 weights[b].contiguous().data_ptr<float>(),
-                total);
+                sl, total);
         }
+        auto final_scores = scores.sum(0);
 
-        // ---- CUDA Kernel 2b: Weight multiply (in-place) ----
-        {
-            int threads = 256;
-            int blocks = (total + threads - 1) / threads;
-            weight_mul_kernel<<<blocks, threads, 0, stream>>>(
-                scores.data_ptr<float>(),
-                weights[b].contiguous().data_ptr<float>(),
-                sl,
-                total);
-        }
-
-        // ---- Head reduction (at::sum matches reference exactly) ----
-        auto final_scores = scores.sum(0);  // [sl]
-
-        // ---- TopK (at::topk matches reference exactly) ----
         const int actual_k = (sl < TOPK) ? sl : TOPK;
         auto topk_result = at::topk(final_scores, actual_k);
         auto idx = std::get<1>(topk_result);
 
-        // ---- CUDA Kernel 3: index conversion ----
         {
             int threads = 256;
             int blocks = (actual_k + 255) / 256;
@@ -273,7 +203,7 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_cuda_v8",
+            name="dsa_topk_kernel5_fixed",
             cpp_sources=[_cpp_src],
             cuda_sources=[_cuda_src],
             functions=["dsa_topk_run"],
@@ -294,3 +224,4 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
         block_table.contiguous(),
         topk_indices,
     )
+

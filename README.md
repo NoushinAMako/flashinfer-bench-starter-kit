@@ -20,6 +20,67 @@ Create high-performance GPU kernels for state-of-the-art LLM architectures on NV
 
 [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
 
+## 🏆 Our Solution — DSA TopK Indexer (dsa_topk_indexer_fp8_h64_d128_topk2048_ps64)
+
+**Winner: solution11** — 8-stream multi-stream CUDA graph with fork/join capture.
+
+### Final Results (NVIDIA B200, Modal)
+
+| Metric | Value |
+|--------|-------|
+| **Workloads passed** | **128 / 128** (abs_err = 0.00, rel_err = 0.00) |
+| **Mean speedup** | **14.14×** |
+| **Median speedup** | **14.19×** |
+| **Large-half mean** | **17.07×** |
+| Min speedup | 6.94× |
+| Max speedup | 22.64× |
+
+### How we got here — full progression
+
+| Solution | Key idea | B200 mean | H100 mean | Passes |
+|---|---|---|---|---|
+| Reference (solution3) | Unoptimized Python baseline | 1.0× | 1.0× | ✅ 128/128 |
+| solution/ (v8) | Custom CUDA kernels, single-stream, no graph | — | 4.44× | ✅ 128/128 |
+| solution7 | 4 parallel CUDA streams | 5.43× | 5.84× | ✅ 128/128 |
+| solution8 | 4 streams + TMA prefetch | 5.26× | — | ✅ 128/128 |
+| solution9 | 1-stream CUDA graph (eliminates dispatch overhead) | 5.39× | 6.07× | ✅ 128/128 |
+| solution10 | **4-stream CUDA graph** (fork/join) | 10.81× | 12.49× | ✅ 128/128 |
+| **solution11** ✅ | **8-stream CUDA graph** | **14.14×** | **15.76×** | ✅ **128/128** |
+| solution12 ❌ | FP8 GEMM (`_scaled_mm`) — correctness fails | 12.04× | — | ❌ 117/128 |
+
+### Key engineering decisions in solution11
+
+**1. Static-input CUDA graph** (`torch.cuda.CUDAGraph`)
+Every call: async-copy live inputs → static GPU buffers → `g.replay()` → async-copy output back.
+The graph replays in ~1 µs vs ~50+ µs per call for raw ATen dispatch, eliminating all cuBLAS handle-lookup and kernel-selection overhead.
+
+**2. Fork/join multi-stream capture** (`N_STREAMS = 8`)
+The 8 side streams join the capture tree via a persistent `fork_ev` recorded on the default stream inside the graph context. Each of the B batch items dispatches to `streams[b % 8]`.
+For a 30-item batch: 4 items run serially per stream, 8 streams in parallel = `~4×` serialisation vs `~30×` serial.
+
+**3. Persistent CUDA events**
+`cudaEventCreate`/`Destroy` are CPU-only ops that cannot be captured. `fork_ev` and all `done_evs` are allocated once at initialisation and reused across every replay, ensuring graph safety.
+
+**4. Per-stream pre-allocated dequant buffers**
+Each stream owns its own `k_bufs[s]` (`[max_tokens, 128]` float32). No dynamic allocation inside the hot path; the graph captures fixed-address ops only.
+
+**5. Why FP8 GEMM didn't work (solution12)**
+`torch._scaled_mm` on H100/B200 uses FP16-precision multiply internally (not float32). This causes up to ~0.013 absolute score error, enough to reorder topk indices for near-tie tokens → fails abs_err = 0.00 requirement.
+
+### Running solution11
+
+```bash
+# Local (H100)
+FIB_DATASET_PATH=/path/to/flashinfer-trace python scripts/run_local.py
+
+# Cloud (B200 via Modal)
+modal run scripts/run_modal.py
+```
+
+`config.toml` already points to `solution11/triton`.
+
+---
+
 ## Updates
 
 * 2026.02.05: Full dataset for definitions and workloads are released at [HuggingFace](https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest)
