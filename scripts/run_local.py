@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
-from scripts.pack_solution import pack_solution
+from pack_solution_custom import pack_solution
 
 
 def get_trace_set_path() -> str:
@@ -60,6 +60,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     for trace in traces:
         if trace.evaluation:
+            print(trace.evaluation.model_dump_json(indent=2))
             entry = {
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
@@ -114,6 +115,8 @@ def main():
         print("No results returned!")
         return
 
+    import json
+    print(json.dumps(results, indent=2, default=str))
     print_results(results)
 
 
