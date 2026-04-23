@@ -1,0 +1,8 @@
+[solution]
+name = "dsa-attention-v1"
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+author = "makora/team"
+
+[build]
+language = "triton"
+entry_point = "kernel.py::run"

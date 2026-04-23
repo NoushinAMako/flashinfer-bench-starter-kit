@@ -26,8 +26,11 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel",
+        add_python="3.12",
+    )
+    .pip_install("flashinfer-bench", "triton", "numpy")
 )
 
 
@@ -75,6 +78,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            if hasattr(trace.evaluation, "error_message") and trace.evaluation.error_message:
+                entry["error_message"] = trace.evaluation.error_message
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -99,16 +104,26 @@ def print_results(results: dict):
                 rel_err = result.get("max_rel_error", 0)
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
+            if result.get("error_message"):
+                print(f"\n    ERROR: {result['error_message']}", end="")
+
             print()
 
 
 @app.local_entrypoint()
-def main():
-    """Pack solution and run benchmark on Modal."""
+def main(config: str = None):
+    """Pack solution and run benchmark on Modal.
+
+    Args:
+        config: Path to config.toml (default: repo root config.toml).
+                Example: modal run scripts/run_modal.py --config dsa_indexer/config.toml
+    """
+    from pathlib import Path as _Path
     from scripts.pack_solution import pack_solution
 
+    config_path = _Path(config) if config else None
     print("Packing solution from source files...")
-    solution_path = pack_solution()
+    solution_path = pack_solution(config_path=config_path)
 
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())

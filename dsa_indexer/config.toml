@@ -1,0 +1,8 @@
+[solution]
+name = "dsa-topk-v1"
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+author = "makora/team"
+
+[build]
+language = "triton"
+entry_point = "kernel.py::run"
